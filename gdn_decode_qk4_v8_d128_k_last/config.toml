@@ -1,0 +1,9 @@
+[solution]
+name = "DeltaWarp-gdn-decode-v1"
+definition = "gdn_decode_qk4_v8_d128_k_last"
+author = "kinglacto"
+
+[build]
+language = "triton"
+entry_point = "kernel.py::run"
+destination_passing_style = false
