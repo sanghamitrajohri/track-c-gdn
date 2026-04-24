@@ -1,8 +1,9 @@
 [solution]
-name = "my-team-solution-v1"      # Solution name
-definition = "fused_moe"          # Track: fused_moe | sparse_attention | gated_delta_net
-author = "team-name"              # Team/author name
+name = "DeltaWarp-gdn-decode-v2"
+definition = "gdn_decode_qk4_v8_d128_k_last"
+author = "kinglacto"
 
 [build]
-language = "triton"               # triton | cuda
-entry_point = "kernel"            # Kernel function name
+language = "triton"
+entry_point = "kernel.py::run"
+destination_passing_style = false
