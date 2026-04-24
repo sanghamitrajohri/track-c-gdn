@@ -1,5 +1,5 @@
 [solution]
-name = "DeltaWarp-gdn-decode-v1"
+name = "DeltaWarp-gdn-decode-v2"
 definition = "gdn_decode_qk4_v8_d128_k_last"
 author = "kinglacto"
 

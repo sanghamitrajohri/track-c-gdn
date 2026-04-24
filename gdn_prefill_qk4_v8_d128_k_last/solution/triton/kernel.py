@@ -41,6 +41,23 @@ HEAD_SIZE = 128
 HEAD_EXPANSION = NUM_V_HEADS // NUM_Q_HEADS
 SUPPORTED_CHUNK_SIZES = (64, 128)
 
+# Frozen B200 BT64 configs from the Blackwell retune probe on
+# workload `9a5d694b-7d4c-4ee6-8315-a13053ab6f92` (8192 x 57).
+FROZEN_BT64_PREPROCESS_NUM_WARPS = 4
+FROZEN_BT64_PREPROCESS_NUM_STAGES = 3
+FROZEN_BT64_KKT_BK = 64
+FROZEN_BT64_KKT_NUM_WARPS = 2
+FROZEN_BT64_KKT_NUM_STAGES = 3
+FROZEN_BT64_RECOMPUTE_NUM_WARPS = 4
+FROZEN_BT64_RECOMPUTE_NUM_STAGES = 3
+FROZEN_BT64_RECURRENCE_BV = 16
+FROZEN_BT64_RECURRENCE_NUM_WARPS = 2
+FROZEN_BT64_RECURRENCE_NUM_STAGES = 3
+FROZEN_BT64_OUTPUT_BK = 128
+FROZEN_BT64_OUTPUT_BV = 128
+FROZEN_BT64_OUTPUT_NUM_WARPS = 8
+FROZEN_BT64_OUTPUT_NUM_STAGES = 3
+
 if os.environ.get("FLA_USE_FAST_OPS", "0") == "1":
     @triton.jit
     def exp(x):
@@ -457,16 +474,6 @@ def merge_16x16_to_64x64_inverse_kernel(
     'USE_G': lambda args: args['g'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
-    configs=[
-        triton.Config({'BK': BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=['H', 'K', 'BT', 'IS_VARLEN'],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
 def chunk_scaled_dot_kkt_fwd_kernel(
     k,
@@ -545,6 +552,9 @@ def chunk_scaled_dot_kkt_fwd(
         H=H,
         K=K,
         BT=BT,
+        BK=FROZEN_BT64_KKT_BK,
+        num_warps=FROZEN_BT64_KKT_NUM_WARPS,
+        num_stages=FROZEN_BT64_KKT_NUM_STAGES,
     )
     return A
 
@@ -608,13 +618,6 @@ def _invert_unit_lower_block_16(
     'USE_G': lambda args: args['g'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=4, num_stages=3)
-    ],
-    key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
 def recompute_w_u_fwd_kernel(
     k,
@@ -1016,6 +1019,8 @@ def recompute_w_u_fwd(
             BT=BT,
             BK=BK,
             BV=BV,
+            num_warps=FROZEN_BT64_RECOMPUTE_NUM_WARPS,
+            num_stages=FROZEN_BT64_RECOMPUTE_NUM_STAGES,
         )
     else:
         recompute_w_u_fwd_kernel_bt128[(NT, B * H)](
@@ -1046,17 +1051,6 @@ def recompute_w_u_fwd(
     'SAVE_NEW_VALUE': lambda args: args['v_new'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
-    configs=[
-        triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in ([4, 3, 2] if check_shared_mem('ampere') else [2, 1])
-        for BV in ([32, 64] if check_shared_mem('ada') else [32])
-    ],
-    key=['H', 'K', 'V', 'BT', 'USE_EXP2', 'TRANSPOSE_STATE'],
-    use_cuda_graph=USE_CUDA_GRAPH,
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     k,
@@ -1372,7 +1366,7 @@ def chunk_gated_delta_rule_fwd_h(
     final_state = k.new_zeros(N, H, V, K, dtype=torch.float32)
 
     v_new = torch.empty_like(u)
-    def grid(meta): return (triton.cdiv(V, meta['BV']), N*H)
+    def grid(_meta): return (triton.cdiv(V, FROZEN_BT64_RECURRENCE_BV), N * H)
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
         v=u,
@@ -1390,8 +1384,11 @@ def chunk_gated_delta_rule_fwd_h(
         K=K,
         V=V,
         BT=BT,
+        BV=FROZEN_BT64_RECURRENCE_BV,
         USE_EXP2=False,
         TRANSPOSE_STATE=True,
+        num_warps=FROZEN_BT64_RECURRENCE_NUM_WARPS,
+        num_stages=FROZEN_BT64_RECURRENCE_NUM_STAGES,
     )
     return h, v_new, final_state
 
@@ -1400,15 +1397,6 @@ def chunk_gated_delta_rule_fwd_h(
     'USE_G_GAMMA': lambda args: args['g_gamma'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
-    configs=[
-        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3),
-        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
-        triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
-    ],
-    key=['H', 'K', 'V', 'BT', 'TRANSPOSE_STATE'],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
 def chunk_fwd_kernel_o(
     q,
@@ -1528,7 +1516,7 @@ def chunk_fwd_o(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     o = torch.empty_like(v)
-    def grid(meta): return (triton.cdiv(V, meta['BV']), NT, B * H)
+    def grid(_meta): return (triton.cdiv(V, FROZEN_BT64_OUTPUT_BV), NT, B * H)
     chunk_fwd_kernel_o[grid](
         q=q,
         k=k,
@@ -1545,7 +1533,11 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
+        BK=FROZEN_BT64_OUTPUT_BK,
+        BV=FROZEN_BT64_OUTPUT_BV,
         TRANSPOSE_STATE=True,
+        num_warps=FROZEN_BT64_OUTPUT_NUM_WARPS,
+        num_stages=FROZEN_BT64_OUTPUT_NUM_STAGES,
     )
     return o
 
@@ -1678,11 +1670,6 @@ def _validate_inputs(
 @triton.heuristics({
     "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
 })
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4]],
-    key=["H", "BT", "IS_VARLEN"],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=["T"])
 def preprocess_g_beta_chunk_local_cumsum_kernel(
     a,
@@ -1766,6 +1753,8 @@ def preprocess_g_beta_chunk_local_cumsum(
         T=T,
         H=H,
         BT=BT,
+        num_warps=FROZEN_BT64_PREPROCESS_NUM_WARPS,
+        num_stages=FROZEN_BT64_PREPROCESS_NUM_STAGES,
     )
     return g_out, beta_out
 
@@ -1782,10 +1771,9 @@ def run(
     b: torch.Tensor,
     cu_seqlens: torch.Tensor,
     scale: Optional[float],
-    chunk_size: int = 64,
 ):
     _validate_inputs(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens)
-    chunk_size = _normalize_chunk_size(chunk_size)
+    chunk_size = 64
     if scale is None or scale == 0.0:
         scale = 1.0 / math.sqrt(HEAD_SIZE)
     chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
