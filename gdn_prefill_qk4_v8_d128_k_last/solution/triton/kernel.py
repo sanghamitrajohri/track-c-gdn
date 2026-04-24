@@ -6,6 +6,7 @@
 # - changes the hot kernels to operate on the transposed-state path
 # - refresh: uses vectorized CPU chunk-index metadata, Triton fused `g_log`/`beta` preprocessing,
 #   and a wrapper fastpath that skips redundant validation / `.contiguous()` work
+# - v015: add a broader BT64 recurrence autotune set on top of TF32 recompute
 
 import functools
 import inspect
@@ -38,6 +39,7 @@ NUM_K_HEADS = 4
 NUM_V_HEADS = 8
 HEAD_SIZE = 128
 HEAD_EXPANSION = NUM_V_HEADS // NUM_Q_HEADS
+SUPPORTED_CHUNK_SIZES = (64, 128)
 
 if os.environ.get("FLA_USE_FAST_OPS", "0") == "1":
     @triton.jit
@@ -83,6 +85,11 @@ def tensor_cache(fn: Callable[..., Any]) -> Callable[..., Any]:
         return result
 
     return wrapper
+
+
+def _normalize_chunk_size(chunk_size: int) -> int:
+    assert chunk_size in SUPPORTED_CHUNK_SIZES, f"chunk_size must be one of {SUPPORTED_CHUNK_SIZES}, got {chunk_size}"
+    return chunk_size
 
 
 def input_guard(
@@ -491,30 +498,6 @@ def chunk_scaled_dot_kkt_fwd_kernel(
 
     p_b = tl.make_block_ptr(beta + bos*H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     b_b = tl.load(p_b, boundary_check=(0,))
-    p_b1 = tl.make_block_ptr(beta + bos*H + i_h, (T,), (H,), (i_t * BT + 0,), (16,), (0,))
-    p_b2 = tl.make_block_ptr(beta + bos*H + i_h, (T,), (H,), (i_t * BT + 16,), (16,), (0,))
-    p_b3 = tl.make_block_ptr(beta + bos*H + i_h, (T,), (H,), (i_t * BT + 32,), (16,), (0,))
-    p_b4 = tl.make_block_ptr(beta + bos*H + i_h, (T,), (H,), (i_t * BT + 48,), (16,), (0,))
-    b_b1 = tl.load(p_b1, boundary_check=(0,)).to(tl.float32)
-    b_b2 = tl.load(p_b2, boundary_check=(0,)).to(tl.float32)
-    b_b3 = tl.load(p_b3, boundary_check=(0,)).to(tl.float32)
-    b_b4 = tl.load(p_b4, boundary_check=(0,)).to(tl.float32)
-    p_b1 = tl.make_block_ptr(beta + bos*H + i_h, (T,), (H,), (i_t * BT + 0,), (16,), (0,))
-    p_b2 = tl.make_block_ptr(beta + bos*H + i_h, (T,), (H,), (i_t * BT + 16,), (16,), (0,))
-    p_b3 = tl.make_block_ptr(beta + bos*H + i_h, (T,), (H,), (i_t * BT + 32,), (16,), (0,))
-    p_b4 = tl.make_block_ptr(beta + bos*H + i_h, (T,), (H,), (i_t * BT + 48,), (16,), (0,))
-    b_b1 = tl.load(p_b1, boundary_check=(0,)).to(tl.float32)
-    b_b2 = tl.load(p_b2, boundary_check=(0,)).to(tl.float32)
-    b_b3 = tl.load(p_b3, boundary_check=(0,)).to(tl.float32)
-    b_b4 = tl.load(p_b4, boundary_check=(0,)).to(tl.float32)
-    p_b1 = tl.make_block_ptr(beta + bos*H + i_h, (T,), (H,), (i_t * BT + 0,), (16,), (0,))
-    p_b2 = tl.make_block_ptr(beta + bos*H + i_h, (T,), (H,), (i_t * BT + 16,), (16,), (0,))
-    p_b3 = tl.make_block_ptr(beta + bos*H + i_h, (T,), (H,), (i_t * BT + 32,), (16,), (0,))
-    p_b4 = tl.make_block_ptr(beta + bos*H + i_h, (T,), (H,), (i_t * BT + 48,), (16,), (0,))
-    b_b1 = tl.load(p_b1, boundary_check=(0,)).to(tl.float32)
-    b_b2 = tl.load(p_b2, boundary_check=(0,)).to(tl.float32)
-    b_b3 = tl.load(p_b3, boundary_check=(0,)).to(tl.float32)
-    b_b4 = tl.load(p_b4, boundary_check=(0,)).to(tl.float32)
 
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
@@ -565,6 +548,62 @@ def chunk_scaled_dot_kkt_fwd(
     )
     return A
 
+
+@triton.jit
+def _load_vector_block_16(
+    x,
+    row_start,
+    T,
+    H: tl.constexpr,
+):
+    p_x = tl.make_block_ptr(x, (T,), (H,), (row_start,), (16,), (0,))
+    return tl.load(p_x, boundary_check=(0,)).to(tl.float32)
+
+
+@triton.jit
+def _load_matrix_block_16x16(
+    A,
+    chunk_row_start,
+    row_offset,
+    col_offset,
+    T,
+    H: tl.constexpr,
+    BT: tl.constexpr,
+):
+    p_A = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (chunk_row_start + row_offset, col_offset), (16, 16), (1, 0))
+    return tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
+
+
+@triton.jit
+def _invert_unit_lower_block_16(
+    A,
+    chunk_row_start,
+    row_offset,
+    T,
+    H: tl.constexpr,
+    BT: tl.constexpr,
+):
+    row_start = chunk_row_start + row_offset
+    o_i = tl.arange(0, 16)
+    m_A = o_i[:, None] > o_i[None, :]
+    m_I = o_i[:, None] == o_i[None, :]
+
+    p_A = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (row_start, row_offset), (16, 16), (1, 0))
+    b_Ai = tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
+    b_Ai = -tl.where(m_A, b_Ai, 0)
+
+    for i in range(2, 16):
+        current_row = row_start + i
+        b_a = -tl.load(
+            A + current_row * H * BT + row_offset + o_i,
+            mask=(current_row < T) & (o_i < i),
+            other=0.0,
+        )
+        b_a += tl.sum(b_a[:, None] * b_Ai, 0)
+        b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
+    b_Ai += m_I
+    return b_Ai
+
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
@@ -607,8 +646,6 @@ def recompute_w_u_fwd_kernel(
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
-    p_b = tl.make_block_ptr(beta + bos*H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-    b_b = tl.load(p_b, boundary_check=(0,))
     p_b1 = tl.make_block_ptr(beta + bos*H + i_h, (T,), (H,), (i_t * BT + 0,), (16,), (0,))
     p_b2 = tl.make_block_ptr(beta + bos*H + i_h, (T,), (H,), (i_t * BT + 16,), (16,), (0,))
     p_b3 = tl.make_block_ptr(beta + bos*H + i_h, (T,), (H,), (i_t * BT + 32,), (16,), (0,))
@@ -675,25 +712,25 @@ def recompute_w_u_fwd_kernel(
     b_A_42 = tl.load(p_A_42, boundary_check=(0, 1)).to(tl.float32)
     b_A_43 = tl.load(p_A_43, boundary_check=(0, 1)).to(tl.float32)
 
-    b_Ai_21 = -tl.dot(tl.dot(b_Ai_22, b_A_21, allow_tf32=False), b_Ai_11, allow_tf32=False)
-    b_Ai_32 = -tl.dot(tl.dot(b_Ai_33, b_A_32, allow_tf32=False), b_Ai_22, allow_tf32=False)
-    b_Ai_43 = -tl.dot(tl.dot(b_Ai_44, b_A_43, allow_tf32=False), b_Ai_33, allow_tf32=False)
+    b_Ai_21 = -tl.dot(tl.dot(b_Ai_22, b_A_21, allow_tf32=True), b_Ai_11, allow_tf32=True)
+    b_Ai_32 = -tl.dot(tl.dot(b_Ai_33, b_A_32, allow_tf32=True), b_Ai_22, allow_tf32=True)
+    b_Ai_43 = -tl.dot(tl.dot(b_Ai_44, b_A_43, allow_tf32=True), b_Ai_33, allow_tf32=True)
     b_Ai_31 = -tl.dot(
         b_Ai_33,
-        tl.dot(b_A_31, b_Ai_11, allow_tf32=False) + tl.dot(b_A_32, b_Ai_21, allow_tf32=False),
-        allow_tf32=False,
+        tl.dot(b_A_31, b_Ai_11, allow_tf32=True) + tl.dot(b_A_32, b_Ai_21, allow_tf32=True),
+        allow_tf32=True,
     )
     b_Ai_42 = -tl.dot(
         b_Ai_44,
-        tl.dot(b_A_42, b_Ai_22, allow_tf32=False) + tl.dot(b_A_43, b_Ai_32, allow_tf32=False),
-        allow_tf32=False,
+        tl.dot(b_A_42, b_Ai_22, allow_tf32=True) + tl.dot(b_A_43, b_Ai_32, allow_tf32=True),
+        allow_tf32=True,
     )
     b_Ai_41 = -tl.dot(
         b_Ai_44,
-        tl.dot(b_A_41, b_Ai_11, allow_tf32=False) +
-        tl.dot(b_A_42, b_Ai_21, allow_tf32=False) +
-        tl.dot(b_A_43, b_Ai_31, allow_tf32=False),
-        allow_tf32=False,
+        tl.dot(b_A_41, b_Ai_11, allow_tf32=True) +
+        tl.dot(b_A_42, b_Ai_21, allow_tf32=True) +
+        tl.dot(b_A_43, b_Ai_31, allow_tf32=True),
+        allow_tf32=True,
     )
 
     for i_v in range(tl.cdiv(V, BV)):
@@ -709,26 +746,16 @@ def recompute_w_u_fwd_kernel(
         b_v2 = (tl.load(p_v2, boundary_check=(0, 1)) * b_b2[:, None]).to(tl.float32)
         b_v3 = (tl.load(p_v3, boundary_check=(0, 1)) * b_b3[:, None]).to(tl.float32)
         b_v4 = (tl.load(p_v4, boundary_check=(0, 1)) * b_b4[:, None]).to(tl.float32)
-        b_u1 = tl.dot(b_Ai_11, b_v1, allow_tf32=False)
-        b_u2 = tl.dot(b_Ai_21, b_v1, allow_tf32=False) + tl.dot(b_Ai_22, b_v2, allow_tf32=False)
-        b_u3 = tl.dot(b_Ai_31, b_v1, allow_tf32=False) + tl.dot(b_Ai_32, b_v2, allow_tf32=False) + tl.dot(b_Ai_33, b_v3, allow_tf32=False)
-        b_u4 = tl.dot(b_Ai_41, b_v1, allow_tf32=False) + tl.dot(b_Ai_42, b_v2, allow_tf32=False) + tl.dot(b_Ai_43, b_v3, allow_tf32=False) + tl.dot(b_Ai_44, b_v4, allow_tf32=False)
+        b_u1 = tl.dot(b_Ai_11, b_v1, allow_tf32=True)
+        b_u2 = tl.dot(b_Ai_21, b_v1, allow_tf32=True) + tl.dot(b_Ai_22, b_v2, allow_tf32=True)
+        b_u3 = tl.dot(b_Ai_31, b_v1, allow_tf32=True) + tl.dot(b_Ai_32, b_v2, allow_tf32=True) + tl.dot(b_Ai_33, b_v3, allow_tf32=True)
+        b_u4 = tl.dot(b_Ai_41, b_v1, allow_tf32=True) + tl.dot(b_Ai_42, b_v2, allow_tf32=True) + tl.dot(b_Ai_43, b_v3, allow_tf32=True) + tl.dot(b_Ai_44, b_v4, allow_tf32=True)
         tl.store(p_u1, b_u1.to(p_u1.dtype.element_ty), boundary_check=(0, 1))
         tl.store(p_u2, b_u2.to(p_u2.dtype.element_ty), boundary_check=(0, 1))
         tl.store(p_u3, b_u3.to(p_u3.dtype.element_ty), boundary_check=(0, 1))
         tl.store(p_u4, b_u4.to(p_u4.dtype.element_ty), boundary_check=(0, 1))
 
     if USE_G:
-        p_g = tl.make_block_ptr(g + (bos*H + i_h), (T,), (H,), (i_t * BT,), (BT,), (0,))
-        b_g = exp(tl.load(p_g, boundary_check=(0,)))
-        p_g1 = tl.make_block_ptr(g + (bos*H + i_h), (T,), (H,), (i_t * BT + 0,), (16,), (0,))
-        p_g2 = tl.make_block_ptr(g + (bos*H + i_h), (T,), (H,), (i_t * BT + 16,), (16,), (0,))
-        p_g3 = tl.make_block_ptr(g + (bos*H + i_h), (T,), (H,), (i_t * BT + 32,), (16,), (0,))
-        p_g4 = tl.make_block_ptr(g + (bos*H + i_h), (T,), (H,), (i_t * BT + 48,), (16,), (0,))
-        b_g1 = exp(tl.load(p_g1, boundary_check=(0,))).to(tl.float32)
-        b_g2 = exp(tl.load(p_g2, boundary_check=(0,))).to(tl.float32)
-        b_g3 = exp(tl.load(p_g3, boundary_check=(0,))).to(tl.float32)
-        b_g4 = exp(tl.load(p_g4, boundary_check=(0,))).to(tl.float32)
         p_g1 = tl.make_block_ptr(g + (bos*H + i_h), (T,), (H,), (i_t * BT + 0,), (16,), (0,))
         p_g2 = tl.make_block_ptr(g + (bos*H + i_h), (T,), (H,), (i_t * BT + 16,), (16,), (0,))
         p_g3 = tl.make_block_ptr(g + (bos*H + i_h), (T,), (H,), (i_t * BT + 32,), (16,), (0,))
@@ -756,14 +783,197 @@ def recompute_w_u_fwd_kernel(
             b_k2 *= b_g2[:, None]
             b_k3 *= b_g3[:, None]
             b_k4 *= b_g4[:, None]
-        b_w1 = tl.dot(b_Ai_11, b_k1, allow_tf32=False)
-        b_w2 = tl.dot(b_Ai_21, b_k1, allow_tf32=False) + tl.dot(b_Ai_22, b_k2, allow_tf32=False)
-        b_w3 = tl.dot(b_Ai_31, b_k1, allow_tf32=False) + tl.dot(b_Ai_32, b_k2, allow_tf32=False) + tl.dot(b_Ai_33, b_k3, allow_tf32=False)
-        b_w4 = tl.dot(b_Ai_41, b_k1, allow_tf32=False) + tl.dot(b_Ai_42, b_k2, allow_tf32=False) + tl.dot(b_Ai_43, b_k3, allow_tf32=False) + tl.dot(b_Ai_44, b_k4, allow_tf32=False)
+        b_w1 = tl.dot(b_Ai_11, b_k1, allow_tf32=True)
+        b_w2 = tl.dot(b_Ai_21, b_k1, allow_tf32=True) + tl.dot(b_Ai_22, b_k2, allow_tf32=True)
+        b_w3 = tl.dot(b_Ai_31, b_k1, allow_tf32=True) + tl.dot(b_Ai_32, b_k2, allow_tf32=True) + tl.dot(b_Ai_33, b_k3, allow_tf32=True)
+        b_w4 = tl.dot(b_Ai_41, b_k1, allow_tf32=True) + tl.dot(b_Ai_42, b_k2, allow_tf32=True) + tl.dot(b_Ai_43, b_k3, allow_tf32=True) + tl.dot(b_Ai_44, b_k4, allow_tf32=True)
         tl.store(p_w1, b_w1.to(p_w1.dtype.element_ty), boundary_check=(0, 1))
         tl.store(p_w2, b_w2.to(p_w2.dtype.element_ty), boundary_check=(0, 1))
         tl.store(p_w3, b_w3.to(p_w3.dtype.element_ty), boundary_check=(0, 1))
         tl.store(p_w4, b_w4.to(p_w4.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.heuristics({
+    'USE_G': lambda args: args['g'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=3),
+    ],
+    key=['H', 'K', 'V', 'BK', 'BV', 'IS_VARLEN'],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=['T'])
+def recompute_w_u_fwd_kernel_bt128(
+    k,
+    v,
+    beta,
+    w,
+    u,
+    A,
+    g,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    USE_G: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    i_kh = i_h // 2
+    H_K = H // 2
+    if IS_VARLEN:
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
+
+    chunk_row_start = i_t * BT
+    beta += bos * H + i_h
+    A += (bos * H + i_h) * BT
+    v += (bos * H + i_h) * V
+    u += (bos * H + i_h) * V
+    k += (bos * H_K + i_kh) * K
+    w += (bos * H + i_h) * K
+    if USE_G:
+        g += bos * H + i_h
+
+    b_b0 = _load_vector_block_16(beta, chunk_row_start + 0, T, H)
+    b_b1 = _load_vector_block_16(beta, chunk_row_start + 16, T, H)
+    b_b2 = _load_vector_block_16(beta, chunk_row_start + 32, T, H)
+    b_b3 = _load_vector_block_16(beta, chunk_row_start + 48, T, H)
+    b_b4 = _load_vector_block_16(beta, chunk_row_start + 64, T, H)
+    b_b5 = _load_vector_block_16(beta, chunk_row_start + 80, T, H)
+    b_b6 = _load_vector_block_16(beta, chunk_row_start + 96, T, H)
+    b_b7 = _load_vector_block_16(beta, chunk_row_start + 112, T, H)
+
+    b_Ai_0 = _invert_unit_lower_block_16(A, chunk_row_start, 0, T, H, BT)
+    b_Ai_1 = _invert_unit_lower_block_16(A, chunk_row_start, 16, T, H, BT)
+    b_Ai_2 = _invert_unit_lower_block_16(A, chunk_row_start, 32, T, H, BT)
+    b_Ai_3 = _invert_unit_lower_block_16(A, chunk_row_start, 48, T, H, BT)
+    b_Ai_4 = _invert_unit_lower_block_16(A, chunk_row_start, 64, T, H, BT)
+    b_Ai_5 = _invert_unit_lower_block_16(A, chunk_row_start, 80, T, H, BT)
+    b_Ai_6 = _invert_unit_lower_block_16(A, chunk_row_start, 96, T, H, BT)
+    b_Ai_7 = _invert_unit_lower_block_16(A, chunk_row_start, 112, T, H, BT)
+
+    if USE_G:
+        b_g0 = exp(_load_vector_block_16(g, chunk_row_start + 0, T, H)).to(tl.float32)
+        b_g1 = exp(_load_vector_block_16(g, chunk_row_start + 16, T, H)).to(tl.float32)
+        b_g2 = exp(_load_vector_block_16(g, chunk_row_start + 32, T, H)).to(tl.float32)
+        b_g3 = exp(_load_vector_block_16(g, chunk_row_start + 48, T, H)).to(tl.float32)
+        b_g4 = exp(_load_vector_block_16(g, chunk_row_start + 64, T, H)).to(tl.float32)
+        b_g5 = exp(_load_vector_block_16(g, chunk_row_start + 80, T, H)).to(tl.float32)
+        b_g6 = exp(_load_vector_block_16(g, chunk_row_start + 96, T, H)).to(tl.float32)
+        b_g7 = exp(_load_vector_block_16(g, chunk_row_start + 112, T, H)).to(tl.float32)
+
+    for i_v in range(tl.cdiv(V, BV)):
+        for block in range(8):
+            row_offset = block * 16
+            p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (chunk_row_start + row_offset, i_v * BV), (16, BV), (1, 0))
+            p_u = tl.make_block_ptr(u, (T, V), (H * V, 1), (chunk_row_start + row_offset, i_v * BV), (16, BV), (1, 0))
+            if block == 0:
+                b_beta = b_b0
+                b_Ai = b_Ai_0
+            elif block == 1:
+                b_beta = b_b1
+                b_Ai = b_Ai_1
+            elif block == 2:
+                b_beta = b_b2
+                b_Ai = b_Ai_2
+            elif block == 3:
+                b_beta = b_b3
+                b_Ai = b_Ai_3
+            elif block == 4:
+                b_beta = b_b4
+                b_Ai = b_Ai_4
+            elif block == 5:
+                b_beta = b_b5
+                b_Ai = b_Ai_5
+            elif block == 6:
+                b_beta = b_b6
+                b_Ai = b_Ai_6
+            else:
+                b_beta = b_b7
+                b_Ai = b_Ai_7
+            b_rhs = (tl.load(p_v, boundary_check=(0, 1)) * b_beta[:, None]).to(tl.float32)
+            for prev in range(8):
+                if prev < block:
+                    p_prev_u = tl.make_block_ptr(
+                        u, (T, V), (H * V, 1), (chunk_row_start + prev * 16, i_v * BV), (16, BV), (1, 0)
+                    )
+                    b_prev_u = tl.load(p_prev_u, boundary_check=(0, 1)).to(tl.float32)
+                    b_A = _load_matrix_block_16x16(A, chunk_row_start, row_offset, prev * 16, T, H, BT)
+                    b_rhs -= tl.dot(b_A, b_prev_u, allow_tf32=False)
+            b_u = tl.dot(b_Ai, b_rhs, allow_tf32=False)
+            tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
+
+    for i_k in range(tl.cdiv(K, BK)):
+        for block in range(8):
+            row_offset = block * 16
+            p_k = tl.make_block_ptr(k, (T, K), (H_K * K, 1), (chunk_row_start + row_offset, i_k * BK), (16, BK), (1, 0))
+            p_w = tl.make_block_ptr(w, (T, K), (H * K, 1), (chunk_row_start + row_offset, i_k * BK), (16, BK), (1, 0))
+            if block == 0:
+                b_beta = b_b0
+                b_Ai = b_Ai_0
+                if USE_G:
+                    b_g = b_g0
+            elif block == 1:
+                b_beta = b_b1
+                b_Ai = b_Ai_1
+                if USE_G:
+                    b_g = b_g1
+            elif block == 2:
+                b_beta = b_b2
+                b_Ai = b_Ai_2
+                if USE_G:
+                    b_g = b_g2
+            elif block == 3:
+                b_beta = b_b3
+                b_Ai = b_Ai_3
+                if USE_G:
+                    b_g = b_g3
+            elif block == 4:
+                b_beta = b_b4
+                b_Ai = b_Ai_4
+                if USE_G:
+                    b_g = b_g4
+            elif block == 5:
+                b_beta = b_b5
+                b_Ai = b_Ai_5
+                if USE_G:
+                    b_g = b_g5
+            elif block == 6:
+                b_beta = b_b6
+                b_Ai = b_Ai_6
+                if USE_G:
+                    b_g = b_g6
+            else:
+                b_beta = b_b7
+                b_Ai = b_Ai_7
+                if USE_G:
+                    b_g = b_g7
+            b_rhs = (tl.load(p_k, boundary_check=(0, 1)) * b_beta[:, None]).to(tl.float32)
+            if USE_G:
+                b_rhs *= b_g[:, None]
+            for prev in range(8):
+                if prev < block:
+                    p_prev_w = tl.make_block_ptr(
+                        w, (T, K), (H * K, 1), (chunk_row_start + prev * 16, i_k * BK), (16, BK), (1, 0)
+                    )
+                    b_prev_w = tl.load(p_prev_w, boundary_check=(0, 1)).to(tl.float32)
+                    b_A = _load_matrix_block_16x16(A, chunk_row_start, row_offset, prev * 16, T, H, BT)
+                    b_rhs -= tl.dot(b_A, b_prev_w, allow_tf32=False)
+            b_w = tl.dot(b_Ai, b_rhs, allow_tf32=False)
+            tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
 def recompute_w_u_fwd(
     k: torch.Tensor,
@@ -778,6 +988,7 @@ def recompute_w_u_fwd(
     H = beta.shape[-1]
     assert H == H_K * HEAD_EXPANSION
     BT = A.shape[-1]
+    BT = _normalize_chunk_size(BT)
     BK = 64
     BV = 64
 
@@ -787,24 +998,44 @@ def recompute_w_u_fwd(
 
     w = torch.empty(B, T, H, K, device=k.device, dtype=k.dtype)
     u = torch.empty_like(v)
-    recompute_w_u_fwd_kernel[(NT, B*H)](
-        k=k,
-        v=v,
-        beta=beta,
-        w=w,
-        u=u,
-        A=A,
-        g=g,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        K=K,
-        V=V,
-        BT=BT,
-        BK=BK,
-        BV=BV,
-    )
+    if BT == 64:
+        recompute_w_u_fwd_kernel[(NT, B * H)](
+            k=k,
+            v=v,
+            beta=beta,
+            w=w,
+            u=u,
+            A=A,
+            g=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            K=K,
+            V=V,
+            BT=BT,
+            BK=BK,
+            BV=BV,
+        )
+    else:
+        recompute_w_u_fwd_kernel_bt128[(NT, B * H)](
+            k=k,
+            v=v,
+            beta=beta,
+            w=w,
+            u=u,
+            A=A,
+            g=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            K=K,
+            V=V,
+            BT=BT,
+            BK=BK,
+            BV=BV,
+        )
     return w, u
 
 @triton.heuristics({
@@ -818,7 +1049,7 @@ def recompute_w_u_fwd(
 @triton.autotune(
     configs=[
         triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
+        for num_warps in [2, 4, 8]
         for num_stages in ([4, 3, 2] if check_shared_mem('ampere') else [2, 1])
         for BV in ([32, 64] if check_shared_mem('ada') else [32])
     ],
@@ -1121,12 +1352,13 @@ def chunk_gated_delta_rule_fwd_h(
     initial_state: torch.Tensor | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
+    chunk_size: int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     B, T, H_K, K = k.shape
     H = u.shape[2]
     V = u.shape[-1]
     assert H == H_K * HEAD_EXPANSION
-    BT = 64
+    BT = _normalize_chunk_size(chunk_size)
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
@@ -1284,12 +1516,13 @@ def chunk_fwd_o(
     scale: float,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
+    chunk_size: int = 64,
 ) -> torch.Tensor:
     B, T, H_Q, K = q.shape
     H = v.shape[2]
     V = v.shape[-1]
     assert H == H_Q * HEAD_EXPANSION
-    BT = 64
+    BT = _normalize_chunk_size(chunk_size)
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
@@ -1351,20 +1584,27 @@ def chunk_gated_delta_rule_fwd(
     scale: float,
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.LongTensor | None = None,
+    chunk_indices: torch.LongTensor | None = None,
+    g_is_cumsum: bool = False,
+    chunk_size: int = 64,
 ):
-    chunk_indices = prepare_chunk_indices(cu_seqlens, 64) if cu_seqlens is not None else None
-    g = chunk_local_cumsum_scalar(
-        g=g,
-        chunk_size=64,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        output_dtype=torch.float,
-    )
+    chunk_size = _normalize_chunk_size(chunk_size)
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    if not g_is_cumsum:
+        g = chunk_local_cumsum_scalar(
+            g=g,
+            chunk_size=chunk_size,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            output_dtype=torch.float,
+        )
     a_inv = chunk_scaled_dot_kkt_fwd(
         k=k,
         g=g,
         beta=beta,
         cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
         output_dtype=torch.float32,
         chunk_indices=chunk_indices,
     )
@@ -1385,6 +1625,7 @@ def chunk_gated_delta_rule_fwd(
         initial_state=initial_state,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        chunk_size=chunk_size,
     )
     o = chunk_fwd_o(
         q=q,
@@ -1395,6 +1636,7 @@ def chunk_gated_delta_rule_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        chunk_size=chunk_size,
     )
     return o, final_state
 
@@ -1433,24 +1675,44 @@ def _validate_inputs(
         assert state.shape == (cu_seqlens.numel() - 1, NUM_V_HEADS, HEAD_SIZE, HEAD_SIZE)
 
 
+@triton.heuristics({
+    "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+})
 @triton.autotune(
-    configs=[triton.Config({}, num_warps=4)],
-    key=["T", "H"],
+    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4]],
+    key=["H", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )
-@triton.jit
-def preprocess_g_beta_kernel(
+@triton.jit(do_not_specialize=["T"])
+def preprocess_g_beta_chunk_local_cumsum_kernel(
     a,
     b,
     A_log,
     dt_bias,
     g_out,
     beta_out,
+    cu_seqlens,
+    chunk_indices,
     T,
     H: tl.constexpr,
     BT: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
 ):
     i_t = tl.program_id(0)
+    if IS_VARLEN:
+        i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
+        i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+    else:
+        bos = 0
+
+    a += (bos * H).to(tl.int64)
+    b += (bos * H).to(tl.int64)
+    g_out += (bos * H).to(tl.int64)
+    beta_out += (bos * H).to(tl.int64)
+
     p_a = tl.make_block_ptr(a, (T, H), (H, 1), (i_t * BT, 0), (BT, H), (1, 0))
     p_b = tl.make_block_ptr(b, (T, H), (H, 1), (i_t * BT, 0), (BT, H), (1, 0))
     p_g = tl.make_block_ptr(g_out, (T, H), (H, 1), (i_t * BT, 0), (BT, H), (1, 0))
@@ -1459,41 +1721,51 @@ def preprocess_g_beta_kernel(
     b_a = tl.load(p_a, boundary_check=(0, 1)).to(tl.float32)
     b_b = tl.load(p_b, boundary_check=(0, 1)).to(tl.float32)
     h_ids = tl.arange(0, H)
-    b_A_log = tl.load(A_log + h_ids, mask=h_ids < H, other=0.0).to(tl.float32)
+    b_decay = exp(tl.load(A_log + h_ids, mask=h_ids < H, other=0.0).to(tl.float32))
     b_dt_bias = tl.load(dt_bias + h_ids, mask=h_ids < H, other=0.0).to(tl.float32)
 
     x = b_a + b_dt_bias[None, :]
     softplus_x = tl.where(
         x > 0,
-        x + tl.log(1.0 + tl.exp(-x)),
-        tl.log(1.0 + tl.exp(x)),
+        x + tl.log(1.0 + exp(-x)),
+        tl.log(1.0 + exp(x)),
     )
-    b_g = -tl.exp(b_A_log)[None, :] * softplus_x
+    b_g = -b_decay[None, :] * softplus_x
+    b_g = tl.cumsum(b_g, axis=0)
     b_beta = tl.sigmoid(b_b)
 
     tl.store(p_g, b_g.to(p_g.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_beta, b_beta.to(p_beta.dtype.element_ty), boundary_check=(0, 1))
 
 
-def preprocess_g_beta(
+def preprocess_g_beta_chunk_local_cumsum(
     a: torch.Tensor,
     b: torch.Tensor,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+    chunk_indices: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     T, H = a.shape
+    BT = chunk_size
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     g_out = torch.empty((T, H), device=a.device, dtype=torch.float32)
     beta_out = torch.empty((T, H), device=a.device, dtype=torch.float32)
-    preprocess_g_beta_kernel[(triton.cdiv(T, 128),)](
+    preprocess_g_beta_chunk_local_cumsum_kernel[(NT,)](
         a=a,
         b=b,
         A_log=A_log,
         dt_bias=dt_bias,
         g_out=g_out,
         beta_out=beta_out,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
         T=T,
         H=H,
-        BT=128,
+        BT=BT,
     )
     return g_out, beta_out
 
@@ -1510,18 +1782,33 @@ def run(
     b: torch.Tensor,
     cu_seqlens: torch.Tensor,
     scale: Optional[float],
+    chunk_size: int = 64,
 ):
+    _validate_inputs(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens)
+    chunk_size = _normalize_chunk_size(chunk_size)
     if scale is None or scale == 0.0:
         scale = 1.0 / math.sqrt(HEAD_SIZE)
-    g_log, beta = preprocess_g_beta(a, b, A_log, dt_bias)
+    chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    g, beta = preprocess_g_beta_chunk_local_cumsum(
+        a=a,
+        b=b,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+    )
     output, final_state = chunk_gated_delta_rule_fwd(
         q=q.unsqueeze(0),
         k=k.unsqueeze(0),
         v=v.unsqueeze(0),
-        g=g_log.unsqueeze(0),
+        g=g.unsqueeze(0),
         beta=beta.unsqueeze(0),
         scale=float(scale),
         initial_state=state,
         cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        g_is_cumsum=True,
+        chunk_size=chunk_size,
     )
     return output.squeeze(0), final_state
